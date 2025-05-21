@@ -1,0 +1,372 @@
+---
+title: "Causal Inference with Continuous Exposures: A Tutorial with Application to ICU Data: Real Data Analysis"
+author: "M Ehsan Karim"
+output: 
+  pdf_document:
+    toc: false
+    number_sections: true
+    fig_caption: true
+    citation_package: natbib
+    keep_tex: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(dplyr)
+library(ggplot2)
+library(nnet)
+library(survey)
+library(Publish)
+library(tmle3)
+library(tmle3shift)
+library(sl3)
+library(data.table)
+library(future)
+library(tableone)
+library(MatchIt)
+library(cobalt)
+```
+
+## Download and Prepare RHC Data
+
+```{r data-download, cache=TRUE}
+# Download data
+ObsData <- read.csv("https://hbiostat.org/data/repo/rhc.csv", header = TRUE)
+
+# Calculate Length of Stay
+ObsData$Length.of.Stay <- ObsData$dschdte - ObsData$sadmdte
+ObsData$Length.of.Stay[is.na(ObsData$Length.of.Stay)] <- 
+  ObsData$dthdte[is.na(ObsData$Length.of.Stay)] - 
+  ObsData$sadmdte[is.na(ObsData$Length.of.Stay)]
+
+# Binary outcome
+ObsData$death <- ifelse(ObsData$death == "Yes", 1, 0)
+
+# Remove unwanted outcome variables
+ObsData <- dplyr::select(ObsData, !c(dthdte, 
+                                     lstctdte, 
+                                     dschdte, 
+                                     t3d30, 
+                                     dth30, 
+                                     surv2md1))
+
+# Remove problematic variables
+ObsData <- dplyr::select(ObsData, !c(sadmdte, 
+                                     ptid, 
+                                     X, 
+                                     adld3p, 
+                                     urin1, 
+                                     cat2))
+
+# Convert categorical variables
+factors <- c("cat1", "ca", "death", "cardiohx", "chfhx", "dementhx", "psychhx", 
+             "chrpulhx", "renalhx", "liverhx", "gibledhx", "malighx", "immunhx", 
+             "transhx", "amihx", "sex", "dnr1", "ninsclas", "resp", "card", "neuro", 
+             "gastr", "renal", "meta", "hema", "seps", "trauma", "ortho", "race", 
+             "income")
+ObsData[factors] <- lapply(ObsData[factors], as.factor)
+
+# Recode RHC use
+ObsData$RHC.use <- ifelse(ObsData$swang1 == "RHC", 1, 0)
+ObsData <- dplyr::select(ObsData, -swang1)
+
+# Recode and factor levels
+ObsData$age <- cut(ObsData$age, breaks=c(-Inf, 50, 60, 70, 80, Inf), right=FALSE)
+ObsData$race <- factor(ObsData$race, levels=c("white", "black", "other"))
+ObsData$sex <- relevel(as.factor(ObsData$sex), ref = "Male")
+ObsData$cat1 <- factor(ObsData$cat1, levels = unique(ObsData$cat1))
+levels(ObsData$cat1) <- c("ARF", "CHF", "Other", "Other", "Other", "Other", "Other", "MOSF", "MOSF")
+ObsData$ca <- factor(ObsData$ca, levels = c("No", "Yes"), labels = c("None", "Metastatic"))
+
+# Rename variables
+names(ObsData) <- c("Disease.category", "Cancer", "Death", "Cardiovascular", "Congestive.HF", 
+                    "Dementia", "Psychiatric", "Pulmonary", "Renal", "Hepatic", "GI.Bleed", 
+                    "Tumor", "Immunosupperssion", "Transfer.hx", "MI", "age", "sex", "edu", 
+                    "DASIndex", "APACHE.score", "Glasgow.Coma.Score", "blood.pressure", "WBC", 
+                    "Heart.rate", "Respiratory.rate", "Temperature", "PaO2vs.FIO2", "Albumin", 
+                    "Hematocrit", "Bilirubin", "Creatinine", "Sodium", "Potassium", "PaCo2", 
+                    "PH", "Weight", "DNR.status", "Medical.insurance", "Respiratory.Diag", 
+                    "Cardiovascular.Diag", "Neurological.Diag", "Gastrointestinal.Diag", 
+                    "Renal.Diag", "Metabolic.Diag", "Hematologic.Diag", "Sepsis.Diag", 
+                    "Trauma.Diag", "Orthopedic.Diag", "race", "income", "Length.of.Stay", 
+                    "RHC.use")
+
+str(ObsData)
+# Save cleaned dataset
+saveRDS(ObsData, file = "rhcAnalytic.RDS")
+```
+
+## Load RHC Data
+
+```{r load, cache=TRUE}
+rhc <- readRDS("rhcAnalytic.RDS")
+
+# Define comprehensive confounder set
+covariates <- c(
+  "age", "sex", "Cardiovascular", "Pulmonary", 
+  "Renal", "Congestive.HF", "Cancer",
+  "APACHE.score", "DASIndex", "Albumin", 
+  "Creatinine", "Sodium", "Heart.rate", "WBC",
+  "DNR.status", "Transfer.hx"
+)
+
+# Prepare variables
+rhc <- rhc %>%
+  mutate(
+    A = blood.pressure,
+    Y = as.numeric(as.character(Death))
+  ) %>%
+  filter(!is.na(A), !is.na(Y)) %>%
+  filter(complete.cases(select(., all_of(covariates))))
+```
+
+## Summarize the Exposure
+
+```{r plot-A-distribution, message=FALSE, warning=FALSE, cache=TRUE}
+ggplot(rhc, aes(x = A)) +
+  geom_histogram(aes(y = ..density..), bins = 40, fill = "steelblue", alpha = 0.6) +
+  geom_density(color = "black", linewidth = 1) +
+  labs(
+    title = "Distribution of Blood Pressure (Exposure A)",
+    x = "Blood Pressure",
+    y = "Density"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+## Method 1: IPW with Normal Exposure Model
+
+```{r ipw-normal, cache=TRUE}
+# Numerator: marginal exposure model
+mod_num <- lm(A ~ 1, data = rhc)
+mu_num <- predict(mod_num)
+sd_num <- sd(residuals(mod_num))
+
+# Denominator: exposure conditional on confounders
+form_denom <- as.formula(paste("A ~", 
+                               paste(covariates, collapse = " + ")))
+mod_denom <- lm(form_denom, data = rhc)
+mu_denom <- predict(mod_denom)
+sd_denom <- sd(residuals(mod_denom))
+
+# Densities and weights
+f_num <- dnorm(rhc$A, mean = mu_num, sd = sd_num)
+f_denom <- dnorm(rhc$A, mean = mu_denom, sd = sd_denom)
+rhc$sw_normal <- f_num / f_denom
+
+# Weighted model
+mod_w_normal <- glm(Y ~ A, family = binomial(), 
+                    data = rhc, weights = sw_normal)
+publish(mod_w_normal)
+```
+
+## Method 2: IPW with Quantile Binning
+
+```{r ipw-qbin, cache=TRUE}
+# Create quantile bins
+rhc$qbin <- cut(rhc$A, breaks = quantile(rhc$A, 
+                                         probs = seq(0, 1, 0.1), 
+                                         na.rm = TRUE),
+                include.lowest = TRUE, labels = FALSE)
+
+# Multinomial model for conditional bin probability
+form_q <- as.formula(paste("factor(qbin) ~", 
+                           paste(covariates, collapse = " + ")))
+mod_q <- multinom(form_q, data = rhc, trace = FALSE)
+p_denom <- predict(mod_q, type = "probs")
+row_idx <- cbind(1:nrow(rhc), rhc$qbin)
+p_denom_val <- p_denom[row_idx]
+p_num_val <- 1 / 10
+rhc$sw_qbin <- p_num_val / p_denom_val
+
+# Weighted model
+mod_w_qbin <- glm(Y ~ A, family = binomial(), 
+                  data = rhc, weights = sw_qbin)
+publish(mod_w_qbin)
+```
+
+## Method 3: TMLE with Shift Intervention
+
+```{r tmle-shift, cache=FALSE}
+# TMLE setup
+node_list <- list(W = covariates, A = "A", Y = "Y")
+glm_learner <- make_learner(Lrnr_glm)
+learner_list <- list(Y = glm_learner, A = glm_learner)
+
+tmle_spec <- tmle_shift(
+  delta = 0.1,
+  shift_fxn = function(tmle_task, delta, ...) {
+    a <- tmle_task$get_tmle_node("A")
+    a + delta
+  },
+  max_shift = 1
+)
+
+# Run TMLE
+future::plan(future::sequential)
+tmle_fit <- tmle3(
+  tmle_spec,
+  data = as.data.table(rhc),
+  node_list = node_list,
+  learner_list = learner_list
+)
+
+# Extract estimate
+psi <- tmle_fit$estimates[[1]]$psi
+IC <- tmle_fit$estimates[[1]]$IC
+se <- sd(IC) / sqrt(length(IC))
+ci <- psi + c(-1.96, 1.96) * se
+
+# Output
+data.frame(
+  logOR = psi,
+  OR = exp(psi),
+  se = se,
+  lower = exp(ci[1]),
+  upper = exp(ci[2])
+)
+```
+
+
+## Results
+
+```{r forest-plot-or, message=FALSE, warning=FALSE, cache=TRUE}
+# Manually collect results into a data frame
+estimates <- data.frame(
+  Method = c("IPW (Normal)", "IPW (Quantile Binning)", "TMLE (Shift 0.1)"),
+  logOR = c(
+    coef(mod_w_normal)["A"],
+    coef(mod_w_qbin)["A"],
+    psi
+  ),
+  SE = c(
+    sqrt(vcov(mod_w_normal)["A", "A"]),
+    sqrt(vcov(mod_w_qbin)["A", "A"]),
+    sd(IC) / sqrt(length(IC))
+  )
+)
+
+# Compute OR and 95% CI
+estimates <- estimates %>%
+  mutate(
+    OR = exp(logOR),
+    lower = exp(logOR - 1.96 * SE),
+    upper = exp(logOR + 1.96 * SE)
+  )
+
+# Plot
+ggplot(estimates, aes(x = Method, y = OR)) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.15) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "gray40") +
+  coord_flip() +
+  labs(
+    title = "Estimated Odds Ratio for Effect of Blood Pressure on Death",
+    y = "Odds Ratio (OR)",
+    x = NULL
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+```{r results-table, message=FALSE, warning=FALSE, cache=TRUE}
+library(knitr)
+library(kableExtra)
+
+# Prepare table of OR estimates
+results_table <- estimates %>%
+  transmute(
+    Method,
+    OR = sprintf("%.3f", OR),
+    `95% CI` = sprintf("%.3f – %.3f", lower, upper),
+    SE = sprintf("%.3f", SE)
+  )
+
+# Show as styled table
+kable(results_table, format = "latex", booktabs = TRUE, caption = "Estimated Odds Ratios and 95% Confidence Intervals")
+```
+
+## Save plot 
+
+```{r save-plot, message=FALSE, warning=FALSE, cache=TRUE}
+# Load required libraries
+library(ggplot2)
+library(patchwork)
+
+# Plot 1: Distribution of the exposure A (Blood Pressure)
+p1 <- ggplot(rhc, aes(x = A)) +
+  geom_histogram(aes(y = ..density..), bins = 40, fill = "grey70", color = "black") +
+  geom_density(color = "black", linewidth = 1) +
+  labs(
+    title = "Distribution of Exposure: Blood Pressure",
+    x = "Mean Arterial Blood Pressure (mm Hg)",
+    y = "Density"
+  ) +
+  theme_minimal(base_size = 12)
+
+# Plot 2: Forest plot of estimated odds ratios for death
+p2 <- ggplot(estimates, aes(x = Method, y = OR)) +
+  geom_point(size = 3, color = "black") +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.15, color = "black") +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "grey50") +
+  coord_flip() +
+  labs(
+    title = "Estimated Association with In-Hospital Death",
+    y = "Odds Ratio (per 1 mm Hg increase in Blood Pressure)",
+    x = NULL
+  ) +
+  theme_minimal(base_size = 12)
+
+# Combine plots side by side
+combined_plot <- p1 + p2 + plot_layout(ncol = 2)
+
+# Display
+print(combined_plot)
+
+# Optional: Save the plot
+ggsave("rhc_bw_combined_plot.png", combined_plot, width = 12, height = 5, dpi = 600)
+```
+
+## Diagnostic Checks
+
+To assess the reliability of causal estimates, we conduct several diagnostic checks related to the validity of assumptions and model performance. These include checking weight stability, covariate balance, and the positivity assumption.
+
+### Weight Diagnostics
+
+```{r weight-diagnostics, message=FALSE, warning=FALSE, cache=TRUE}
+# Histograms of weights
+summary(rhc$sw_normal)
+summary(rhc$sw_qbin)
+par(mfrow = c(1, 2))
+hist(rhc$sw_normal, main = "IPW Normal Weights", xlab = "Weight", col = "grey80", border = "white")
+hist(rhc$sw_qbin, main = "IPW Quantile Binning Weights", xlab = "Weight", col = "grey80", border = "white")
+```
+
+Extreme or highly variable weights can indicate misspecification in the exposure model or violations of the positivity assumption.
+
+### Covariate Balance with IPW
+
+```{r covariate-balance, message=FALSE, warning=FALSE, cache=TRUE}
+# Covariate balance before and after IPW using quantile binning
+bal <- bal.tab(
+  as.formula(paste("A ~", paste(covariates, collapse = " + "))),
+  data = rhc,
+  weights = rhc$sw_qbin,
+  method = "weighting"
+)
+bal
+love.plot(bal, abs = TRUE, thresholds = c(m = 0.1))
+```
+
+The love plot shows performance before and after weighting. Good balance is typically indicated by values below 0.1.
+
+### Positivity Check
+
+```{r positivity-check, message=FALSE, warning=FALSE, cache=TRUE}
+# Exposure distribution by confounder category
+ggplot(rhc, aes(x = A, fill = sex)) +
+  geom_density(alpha = 0.5) +
+  labs(title = "Blood Pressure by Sex (as a Proxy for Positivity)", x = "Blood Pressure", y = "Density") +
+  theme_minimal()
+```
+
+This density plot illustrates whether the exposure is sufficiently variable across levels of key confounders. Lack of overlap may indicate a positivity violation.
